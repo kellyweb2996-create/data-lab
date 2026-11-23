@@ -7,8 +7,94 @@ import * as THREE from 'three';
 import { CONFIG } from './config.js';
 import { SimplexNoise, mulberry32, smoothstep, clamp, fitModel } from './utils.js';
 
+// ---------------------------------------------------------------------
+// 모래 텍스처 조절용 상수 — 여기 숫자만 바꿔서 보기 좋게 맞추면 됨
+// ---------------------------------------------------------------------
+/** 지형 한 변(640m)에 텍스처를 몇 번 반복할지. 200이면 한 장이 약 3.2m.
+ *  모래알이 너무 크게 보이면 값을 키우고, 너무 잘면 줄이세요. */
+export const SAND_REPEAT = 200;
+/** 노멀맵 요철 강도 (x, y). 0이면 평평, 2면 두 배로 울퉁불퉁 */
+export const SAND_NORMAL_SCALE = 1.0;
+/** 타일링 깨기용 두 번째 샘플의 크기 배율. 0.27이면 약 3.7배 큰 무늬로 한 번 더 샘플링 */
+export const SAND_MACRO_SCALE = 0.27;
+/** 두 번째(큰) 샘플이 섞이는 평균 비율 (0~1). 위치마다 노이즈로 이 값 주변을 오르내림 */
+export const SAND_MACRO_MIX = 0.45;
+
+/**
+ * 해저 지형 셰이더 수정 (onBeforeCompile에서 호출)
+ *  · 텍스처가 있으면: 같은 텍스처를 두 가지 크기(원래 + 회전·확대)로 샘플링해
+ *    노이즈로 섞는다 → 반복 무늬가 티 나지 않음. diffuse·normal·roughness 모두 같은 비율 사용
+ *  · 텍스처가 없으면: 셰이더로 모래알 + 바람결 물결 무늬와 요철을 절차적으로 생성
+ *  vCWorld(월드 좌표)는 Ocean.injectCaustics가 선언하므로 그 뒤에 함께 주입해야 함
+ */
+function injectSand(shader) {
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', /* glsl */`#include <common>
+      uniform float uSandMacroScale;
+      uniform float uSandMacroMix;
+      float sandHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float sandNoise(vec2 p) {
+        vec2 i = floor(p), f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(mix(sandHash(i), sandHash(i + vec2(1.0, 0.0)), u.x),
+                   mix(sandHash(i + vec2(0.0, 1.0)), sandHash(i + vec2(1.0, 1.0)), u.x), u.y);
+      }
+      // 두 번째 샘플 좌표: 37° 회전 + 확대 + 오프셋 → 원래 격자와 어긋나게
+      vec2 sandMacroUv(vec2 uv) {
+        const mat2 R = mat2(0.8, -0.6, 0.6, 0.8);
+        return R * uv * uSandMacroScale + vec2(0.37, 0.61);
+      }
+      // 위치마다 다른 혼합 비율 (몇 타일에 걸쳐 천천히 변함)
+      float sandMix(vec2 uv) {
+        float n = sandNoise(uv * 0.11) * 0.65 + sandNoise(uv * 0.37) * 0.35;
+        return clamp(uSandMacroMix + (n - 0.5) * 1.1, 0.1, 0.9);
+      }
+      vec4 sandSample(sampler2D tex, vec2 uv) {
+        return mix(texture2D(tex, uv), texture2D(tex, sandMacroUv(uv)), sandMix(uv));
+      }
+
+      // ---- 텍스처가 없을 때 쓰는 절차적 모래 ----
+      float sandRipplePhase(vec2 p) { return p.x * 1.1 + p.y * 0.35 + sandNoise(p * 0.15) * 6.0; }
+      vec3 proceduralSandColor(vec2 p) {
+        float aa = clamp(1.0 - (fwidth(p.x) + fwidth(p.y)) * 12.0, 0.0, 1.0); // 멀면 모래알 생략
+        float grain = sandHash(floor(p * 40.0)) - 0.5;
+        float ripple = sin(sandRipplePhase(p)) * 0.5 + 0.5;
+        float patches = sandNoise(p * 0.08) - 0.5;
+        return vec3(0.88 + ripple * 0.08 + patches * 0.14 + grain * 0.16 * aa);
+      }
+      vec2 proceduralSandGrad(vec2 p) {
+        float aa = clamp(1.0 - (fwidth(p.x) + fwidth(p.y)) * 1.5, 0.0, 1.0);
+        float c = cos(sandRipplePhase(p)) * 0.13 * aa;
+        return vec2(c * 1.1, c * 0.35); // 물결 높이의 x, z 기울기
+      }`)
+    .replace('#include <map_fragment>', /* glsl */`
+      #ifdef USE_MAP
+        vec4 sandCol = sandSample(map, vMapUv);
+        sandCol.rgb *= 0.9 + 0.2 * sandNoise(vMapUv * 0.045); // 넓은 범위의 밝기 얼룩
+        diffuseColor *= sandCol;
+      #else
+        diffuseColor.rgb *= proceduralSandColor(vCWorld.xz);
+      #endif`)
+    .replace('#include <roughnessmap_fragment>', /* glsl */`
+      float roughnessFactor = roughness;
+      #ifdef USE_ROUGHNESSMAP
+        roughnessFactor *= sandSample(roughnessMap, vRoughnessMapUv).g;
+      #endif`)
+    .replace('#include <normal_fragment_maps>', /* glsl */`
+      #ifdef USE_NORMALMAP_TANGENTSPACE
+        vec3 mapN = sandSample(normalMap, vNormalMapUv).xyz * 2.0 - 1.0;
+        mapN.xy *= normalScale;
+        normal = normalize(tbn * mapN);
+      #else
+        {
+          vec2 g = proceduralSandGrad(vCWorld.xz);
+          normal = normalize(normal + mat3(viewMatrix) * vec3(-g.x, 0.0, -g.y));
+        }
+      #endif`);
+}
+
 export class Terrain {
-  constructor(scene, ocean, assets) {
+  constructor(scene, ocean, assets, renderer) {
     this.scene = scene;
     this.ocean = ocean;
     this.rand = mulberry32(CONFIG.seed);
@@ -20,7 +106,7 @@ export class Terrain {
     this.obstacles = [];
     this.time = 0;
 
-    this._buildGround(assets.sand);
+    this._buildGround(assets.sand, renderer);
     this._scatterRocks();
     this._scatterCoral();
     this._scatterSeaweed();
@@ -49,7 +135,7 @@ export class Terrain {
     return clamp(h, -118, -3);
   }
 
-  _buildGround(sand) {
+  _buildGround(sand, renderer) {
     const S = this.seg;
     const geo = new THREE.PlaneGeometry(this.size, this.size, S, S);
     geo.rotateX(-Math.PI / 2);
@@ -61,9 +147,11 @@ export class Terrain {
       this.heights[i] = h;
     }
     // 정점 색: 얕은 모래 → 깊은 진흙, 경사면은 바위색, 군데군데 이끼
+    // 모래 사진이 있으면 그 색을 살리도록 밝은 색조로만 칠함 (텍스처 × 정점 색)
+    const textured = !!sand.diffuse;
     const colors = new Float32Array(pos.count * 3);
-    const sandC = new THREE.Color(0xd9c793), deepC = new THREE.Color(0x5d6266);
-    const rockC = new THREE.Color(0x6f6a62), mossC = new THREE.Color(0x6d8a52);
+    const sandC = new THREE.Color(textured ? 0xffffff : 0xd9c793), deepC = new THREE.Color(textured ? 0x7a8288 : 0x5d6266);
+    const rockC = new THREE.Color(textured ? 0x969086 : 0x6f6a62), mossC = new THREE.Color(textured ? 0xa6c28c : 0x6d8a52);
     const c = new THREE.Color();
     for (let iz = 0; iz <= S; iz++) {
       for (let ix = 0; ix <= S; ix++) {
@@ -76,27 +164,43 @@ export class Terrain {
         const moss = this.noise.noise2D(pos.getX(i) * 0.02, pos.getZ(i) * 0.02);
         if (moss > 0.35 && h > -80) c.lerp(mossC, (moss - 0.35) * 1.5);
         c.lerp(rockC, smoothstep(0.5, 1.1, slope));
-        const j = 0.92 + this.rand() * 0.12; // 로우폴리 느낌을 주는 미세한 얼룩
+        const j = textured ? 1 : 0.92 + this.rand() * 0.12; // 로우폴리 느낌을 주는 미세한 얼룩
         colors[i * 3] = c.r * j; colors[i * 3 + 1] = c.g * j; colors[i * 3 + 2] = c.b * j;
       }
     }
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     geo.computeVertexNormals();
 
-    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.95, metalness: 0 });
-    // 모래 텍스처가 있으면 적용 (없으면 정점 색만으로 로우폴리 스타일)
-    if (sand.diffuse || sand.normal || sand.roughness) {
-      for (const t of [sand.diffuse, sand.normal, sand.roughness]) {
-        if (!t) continue;
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(70, 70);
-        t.anisotropy = 4;
-      }
-      if (sand.diffuse) { sand.diffuse.colorSpace = THREE.SRGBColorSpace; mat.map = sand.diffuse; }
-      if (sand.normal) { mat.normalMap = sand.normal; mat.flatShading = false; }
-      if (sand.roughness) mat.roughnessMap = sand.roughness;
-    }
-    this.ocean.applyCaustics(mat);
+    // 노멀맵이 있으면 부드러운 법선 + 텍스처 요철, 없으면 로우폴리(flat) + 절차적 요철
+    const mat = new THREE.MeshStandardMaterial({
+      vertexColors: true, flatShading: !sand.normal, metalness: 0,
+      roughness: sand.roughness ? 1.0 : 0.95, // 거칠기 맵 값에 곱해지므로 1.0
+    });
+    const maxAniso = renderer.capabilities.getMaxAnisotropy(); // 비스듬한 먼 바닥도 선명하게
+    const setup = (tex, isColor) => {
+      if (!tex) return null;
+      tex.colorSpace = isColor ? THREE.SRGBColorSpace : THREE.NoColorSpace; // 색상만 sRGB, 나머지는 선형
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(SAND_REPEAT, SAND_REPEAT);
+      tex.anisotropy = maxAniso;
+      tex.needsUpdate = true;
+      return tex;
+    };
+    mat.map = setup(sand.diffuse, true);
+    mat.normalMap = setup(sand.normal, false);
+    mat.roughnessMap = setup(sand.roughness, false);
+    mat.normalScale.set(SAND_NORMAL_SCALE, SAND_NORMAL_SCALE);
+
+    this.sandUniforms = {
+      uSandMacroScale: { value: SAND_MACRO_SCALE },
+      uSandMacroMix: { value: SAND_MACRO_MIX },
+    };
+    mat.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, this.sandUniforms);
+      injectSand(shader);                 // 모래 (타일링 깨기 / 절차적 대체)
+      this.ocean.injectCaustics(shader);  // 그 위에 물빛 일렁임 + 안개는 three 기본 처리
+    };
+    mat.customProgramCacheKey = () => 'sand+caustics';
     this.ground = new THREE.Mesh(geo, mat);
     this.scene.add(this.ground);
   }

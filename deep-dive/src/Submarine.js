@@ -171,7 +171,8 @@ export class Submarine {
     this.lightOn = on;
     this.spot.intensity = on ? 55 : 0;
     this.beam.visible = on;
-    this.lampMesh.material.color.setHex(on ? 0xfff6d8 : 0x444444);
+    if (on) this.lampMesh.material.color.setRGB(3.0, 2.85, 2.4); // HDR 값 → 블룸으로 번짐
+    else this.lampMesh.material.color.setHex(0x444444);
   }
 
   getForward(out = new THREE.Vector3()) {

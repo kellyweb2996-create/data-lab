@@ -1,14 +1,14 @@
 // =====================================================================
 // Ocean — 수중 환경 연출
 //   · 수심에 따라 색/밀도가 바뀌는 지수 안개(FogExp2)와 조명
-//   · 수면(아래에서 올려다본 물결), 빛줄기(god rays)
-//   · 해저 물빛 일렁임(caustics) 셰이더 패치
+//   · 수면(아래에서 올려다본 물결), 빛줄기(god rays: 가산 혼합 원뿔)
+//   · 해저 물빛 일렁임(caustics): GLSL 보로노이 노이즈로 실시간 생성
 //   · 부유물 파티클, 거품 파티클
 //   · 수면 기지
 // =====================================================================
 import * as THREE from 'three';
 import { CONFIG } from './config.js';
-import { clamp, lerp, smoothstep, makeGlowTexture, makeRayTexture, makeCausticTexture, mulberry32 } from './utils.js';
+import { clamp, lerp, smoothstep, makeGlowTexture } from './utils.js';
 
 const SHALLOW_COLOR = new THREE.Color(0x1d8fa0); // 수면 근처 청록색
 const MID_COLOR = new THREE.Color(0x0b3d63);
@@ -33,10 +33,7 @@ export class Ocean {
     scene.add(this.hemi, this.sun, this.sun.target);
 
     // ---- caustics 공용 유니폼 (지형/바위 머티리얼에 주입) ----
-    this.causticFrames = assets.caustics;            // 프레임 배열 또는 null
-    const fallback = this.causticFrames ? null : makeCausticTexture(mulberry32(7));
     this.causticUniforms = {
-      uCaustic: { value: this.causticFrames ? this.causticFrames[0] : fallback },
       uCTime: { value: 0 },
       uCStrength: { value: 1.0 },
     };
@@ -49,36 +46,75 @@ export class Ocean {
   }
 
   /**
-   * MeshStandardMaterial에 caustics를 주입한다.
-   * 월드 XZ 좌표로 텍스처를 투영하고, 얕을수록 강하게 비춘다.
+   * 셰이더 문자열에 caustics를 주입한다 (onBeforeCompile 안에서 호출).
+   * 텍스처 없이 보로노이 노이즈 두 겹을 서로 다른 속도로 움직여 겹치고,
+   * 위를 향한 면일수록, 얕을수록 강하게 비춘다.
+   * 다른 셰이더 수정(모래 텍스처 등)과 함께 쓸 수 있도록 분리해 둠.
    */
-  applyCaustics(material) {
-    const u = this.causticUniforms;
-    material.onBeforeCompile = (shader) => {
-      Object.assign(shader.uniforms, u);
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nvarying vec3 vCWorld;')
-        .replace('#include <begin_vertex>', /* glsl */`#include <begin_vertex>
-          vec4 cw = vec4(transformed, 1.0);
-          #ifdef USE_INSTANCING
-            cw = instanceMatrix * cw;
-          #endif
-          vCWorld = (modelMatrix * cw).xyz;`);
-      shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', /* glsl */`#include <common>
-          varying vec3 vCWorld;
-          uniform sampler2D uCaustic; uniform float uCTime; uniform float uCStrength;`)
-        .replace('#include <opaque_fragment>', /* glsl */`
-          {
-            float depthFade = clamp(1.0 + vCWorld.y / 85.0, 0.0, 1.0);
-            vec2 cuv = vCWorld.xz * 0.045;
-            float c1 = texture2D(uCaustic, cuv + vec2(uCTime * 0.021, uCTime * 0.013)).r;
-            float c2 = texture2D(uCaustic, cuv * 1.37 + vec2(-uCTime * 0.016, uCTime * 0.019)).r;
-            float caust = min(c1, c2) * 2.2 + c1 * 0.25;
-            outgoingLight += diffuseColor.rgb * caust * uCStrength * depthFade * depthFade;
+  injectCaustics(shader) {
+    Object.assign(shader.uniforms, this.causticUniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vCWorld;')
+      .replace('#include <begin_vertex>', /* glsl */`#include <begin_vertex>
+        vec4 cw = vec4(transformed, 1.0);
+        #ifdef USE_INSTANCING
+          cw = instanceMatrix * cw;
+        #endif
+        vCWorld = (modelMatrix * cw).xyz;`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', /* glsl */`#include <common>
+        varying vec3 vCWorld;
+        uniform float uCTime; uniform float uCStrength;
+
+        vec2 cHash2(vec2 p) {
+          p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+          return fract(sin(p) * 43758.5453);
+        }
+        // 보로노이: 가장 가까운 두 점까지 거리의 차(F2-F1) = 셀 경계까지의 거리
+        float cVoronoiEdge(vec2 x, float t) {
+          vec2 n = floor(x), f = fract(x);
+          float f1 = 8.0, f2 = 8.0;
+          for (int j = -1; j <= 1; j++) {
+            for (int i = -1; i <= 1; i++) {
+              vec2 g = vec2(float(i), float(j));
+              vec2 o = cHash2(n + g);
+              o = 0.5 + 0.42 * sin(t + 6.2831 * o); // 셀 중심이 제자리에서 맴돔
+              vec2 r = g + o - f;
+              float d = dot(r, r);
+              if (d < f1) { f2 = f1; f1 = d; } else if (d < f2) { f2 = d; }
+            }
           }
-          #include <opaque_fragment>`);
-    };
+          return sqrt(f2) - sqrt(f1);
+        }
+        // 한 겹: 셀 경계가 밝은 빛 그물이 됨
+        float cLayer(vec2 p, float t) {
+          float e = cVoronoiEdge(p, t);
+          return pow(clamp(1.0 - e * 2.4, 0.0, 1.0), 4.0);
+        }
+        float causticPattern(vec2 world, float t) {
+          vec2 p = world * 0.32;
+          p += 0.18 * vec2(sin(p.y * 1.7 + t * 0.8), cos(p.x * 1.3 + t * 0.6)); // 물결 왜곡
+          float l1 = cLayer(p + vec2(t * 0.05, t * 0.03), t * 0.9);
+          float l2 = cLayer(p * 1.43 + vec2(-t * 0.04, t * 0.06) + 17.0, t * 1.35);
+          float c = (l1 + l2) * 0.55 + l1 * l2 * 1.6;
+          // 멀리서 그물이 픽셀보다 가늘어지면 반짝임 대신 평균 밝기로
+          float aa = 1.0 - smoothstep(0.12, 0.5, fwidth(p.x) + fwidth(p.y));
+          return mix(0.22, c, aa);
+        }`)
+      .replace('#include <opaque_fragment>', /* glsl */`
+        {
+          float depthFade = clamp(1.0 + vCWorld.y / 85.0, 0.0, 1.0);   // 깊을수록 약하게
+          vec3 wN = inverseTransformDirection(normal, viewMatrix);      // 월드 법선
+          float facing = clamp(wN.y * 1.25 - 0.15, 0.0, 1.0);           // 위를 향한 면만
+          float caust = causticPattern(vCWorld.xz, uCTime);
+          outgoingLight += diffuseColor.rgb * vec3(0.9, 1.0, 1.06) * caust * uCStrength * depthFade * depthFade * facing;
+        }
+        #include <opaque_fragment>`);
+  }
+
+  /** caustics만 쓰는 머티리얼(바위·난파선)에 적용 */
+  applyCaustics(material) {
+    material.onBeforeCompile = (shader) => this.injectCaustics(shader);
     material.customProgramCacheKey = () => 'caustics';
     return material;
   }
@@ -122,21 +158,57 @@ export class Ocean {
     this.scene.add(this.surface);
   }
 
-  // ---- 빛줄기: 카메라를 향하는 세로 판들을 가산 혼합 -------------------
+  // ---- 빛줄기: 반투명 원뿔 여러 개를 가산 혼합, 천천히 흔들림 ----------
   _buildGodRays() {
-    const tex = makeRayTexture();
-    const geo = new THREE.PlaneGeometry(1, 1);
-    geo.translate(0, -0.5, 0); // 윗변이 원점 → 수면에서 아래로 뻗음
+    // 위가 좁고 아래로 퍼지는 열린 원뿔대. 윗면이 원점, 아래로 길이 1
+    const geo = new THREE.CylinderGeometry(0.2, 1, 1, 20, 1, true);
+    geo.translate(0, -0.5, 0);
+    const base = new THREE.ShaderMaterial({
+      uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, {
+        uOpacity: { value: 0 },
+        uColor: { value: new THREE.Color(0xcff8ff) },
+      }]),
+      vertexShader: /* glsl */`
+        varying float vH; varying vec3 vN; varying vec3 vV;
+        #include <fog_pars_vertex>
+        void main(){
+          vH = -position.y; // 0(수면) ~ 1(끝)
+          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+          vN = normalize(normalMatrix * normal);
+          vV = normalize(-mvPosition.xyz);
+          gl_Position = projectionMatrix * mvPosition;
+          #include <fog_vertex>
+        }`,
+      fragmentShader: /* glsl */`
+        uniform float uOpacity; uniform vec3 uColor;
+        varying float vH; varying vec3 vN; varying vec3 vV;
+        #include <fog_pars_fragment>
+        void main(){
+          float core = pow(abs(dot(normalize(vN), normalize(vV))), 2.2); // 가장자리는 부드럽게 사라짐
+          float fade = pow(1.0 - vH, 1.7) * smoothstep(0.0, 0.05, vH);   // 아래로 갈수록 옅어짐
+          float a = uOpacity * core * fade;
+          #ifdef USE_FOG
+            // 가산 혼합이라 안개색을 더하지 않고, 안개만큼 투명하게
+            float fogF = 1.0 - exp(-fogDensity * fogDensity * vFogDepth * vFogDepth);
+            a *= 1.0 - fogF;
+          #endif
+          gl_FragColor = vec4(uColor, a);
+        }`,
+      fog: true, transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+    });
     this.rays = [];
-    for (let i = 0; i < 18; i++) {
-      const mat = new THREE.MeshBasicMaterial({
-        map: tex, color: 0xcff8ff, transparent: true, opacity: 0, depthWrite: false,
-        blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: true,
-      });
-      const m = new THREE.Mesh(geo, mat);
-      m.scale.set(3 + Math.random() * 7, 45 + Math.random() * 40, 1);
-      m.userData = { phase: Math.random() * 10, base: 0.12 + Math.random() * 0.16 };
-      m.position.set((Math.random() - 0.5) * 140, -0.5, (Math.random() - 0.5) * 140);
+    for (let i = 0; i < 16; i++) {
+      const m = new THREE.Mesh(geo, base.clone());
+      const r = 2 + Math.random() * 4.5;
+      m.scale.set(r, 50 + Math.random() * 45, r);
+      // 해가 +X, +Z 쪽에 있으므로 빛줄기 끝이 -X, -Z 로 비스듬히
+      m.userData = {
+        phase: Math.random() * 10, base: 0.08 + Math.random() * 0.1,
+        tiltX: 0.12 + Math.random() * 0.06, tiltZ: -0.3 - Math.random() * 0.08,
+      };
+      m.position.set((Math.random() - 0.5) * 140, -0.3, (Math.random() - 0.5) * 140);
+      m.frustumCulled = false;
       this.rays.push(m);
       this.scene.add(m);
     }
@@ -157,11 +229,11 @@ export class Ocean {
       uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, {
         uCam: { value: new THREE.Vector3() }, uTime: { value: 0 }, uBox: { value: BOX },
         uColor: { value: new THREE.Color(0xd8f4ff) }, uBright: { value: 1 },
-        uPixel: { value: 1 },
+        uPixel: { value: 1 }, uGlow: { value: 0 },
       }]),
       vertexShader: /* glsl */`
-        uniform vec3 uCam; uniform float uTime; uniform float uBox; uniform float uPixel;
-        attribute float aSeed; varying float vAlpha;
+        uniform vec3 uCam; uniform float uTime; uniform float uBox; uniform float uPixel; uniform float uGlow;
+        attribute float aSeed; varying float vAlpha; varying float vGlow;
         #include <fog_pars_vertex>
         void main(){
           vec3 p = position + vec3(sin(uTime * 0.3 + aSeed * 6.28) * 0.6, -uTime * (0.15 + aSeed * 0.2), cos(uTime * 0.23 + aSeed * 3.0) * 0.6);
@@ -170,15 +242,20 @@ export class Ocean {
           gl_Position = projectionMatrix * mvPosition;
           gl_PointSize = min(uPixel * (0.6 + aSeed * 1.4) * (50.0 / max(1.0, -mvPosition.z)), 10.0 * uPixel);
           vAlpha = 1.0 - smoothstep(uBox * 0.3, uBox * 0.5, length(p - uCam));
+          // 약 5%는 심해에서 깜빡이며 빛나는 발광 플랑크톤
+          vGlow = step(0.95, aSeed) * uGlow * (0.35 + 0.65 * pow(0.5 + 0.5 * sin(uTime * (1.5 + aSeed * 3.0) + aSeed * 40.0), 3.0));
+          gl_PointSize *= 1.0 + vGlow * 1.5;
           #include <fog_vertex>
         }`,
       fragmentShader: /* glsl */`
-        uniform vec3 uColor; uniform float uBright; varying float vAlpha;
+        uniform vec3 uColor; uniform float uBright; varying float vAlpha; varying float vGlow;
         #include <fog_pars_fragment>
         void main(){
           float a = smoothstep(0.5, 0.0, length(gl_PointCoord - 0.5));
-          gl_FragColor = vec4(uColor * uBright, a * vAlpha * 0.65);
+          vec3 col = mix(uColor * uBright, vec3(0.35, 1.0, 0.9) * 3.0, vGlow); // 발광체는 HDR로 밝게 → 블룸
+          gl_FragColor = vec4(col, a * vAlpha * mix(0.65, 1.0, vGlow));
           #include <fog_fragment>
+          gl_FragColor.rgb = mix(gl_FragColor.rgb, col, vGlow * 0.7); // 발광은 안개를 뚫고 보이게
         }`,
       fog: true, transparent: true, depthWrite: false,
     });
@@ -359,12 +436,8 @@ export class Ocean {
     this.sun.intensity = 1.7 * light;
     this.causticUniforms.uCStrength.value = 0.9 * (0.15 + 0.85 * light);
 
-    // ---- caustics 애니메이션 ----
+    // ---- caustics 애니메이션 (셰이더가 시간으로 직접 생성) ----
     this.causticUniforms.uCTime.value = t;
-    if (this.causticFrames) {
-      const idx = Math.floor(t * 20) % this.causticFrames.length;
-      this.causticUniforms.uCaustic.value = this.causticFrames[idx];
-    }
 
     // ---- 수면 ----
     this.surfaceMat.uniforms.uTime.value = t;
@@ -379,10 +452,12 @@ export class Ocean {
         r.position.x = cp.x + Math.cos(a) * rr;
         r.position.z = cp.z + Math.sin(a) * rr;
       }
-      r.rotation.y = Math.atan2(cp.x - r.position.x, cp.z - r.position.z); // Y축 빌보드
+      // 수면을 축으로 천천히 흔들림
       const u = r.userData;
-      r.material.opacity = rayFade * u.base * (0.6 + 0.4 * Math.sin(t * 0.6 + u.phase));
-      r.visible = r.material.opacity > 0.003;
+      r.rotation.set(u.tiltX + Math.sin(t * 0.23 + u.phase) * 0.05, 0, u.tiltZ + Math.cos(t * 0.19 + u.phase * 1.3) * 0.06);
+      const op = rayFade * u.base * (0.6 + 0.4 * Math.sin(t * 0.6 + u.phase));
+      r.material.uniforms.uOpacity.value = op;
+      r.visible = op > 0.003;
     }
 
     // ---- 파티클 ----
@@ -390,12 +465,13 @@ export class Ocean {
     this.snowMat.uniforms.uTime.value = t;
     const bright = 0.12 + 0.88 * light + (lightOn ? 0.45 : 0);
     this.snowMat.uniforms.uBright.value = bright;
+    this.snowMat.uniforms.uGlow.value = smoothstep(35, 85, depth);
     this.bubbleMat.uniforms.uBright.value = Math.min(1, bright + 0.2);
     this._updateBubbles(dt);
 
     // ---- 기지 표시등 깜빡임 ----
     const blink = 0.55 + 0.45 * Math.sin(t * 3);
-    this.dockLightMat.color.setRGB(0.37 * blink + 0.1, 0.96 * blink + 0.04, 1.0 * blink);
+    this.dockLightMat.color.setRGB(0.37 * blink + 0.1, 0.96 * blink + 0.04, 1.0 * blink).multiplyScalar(2.2); // 블룸
     this.baseGlow.material.opacity = 0.4 + 0.4 * blink;
   }
 }

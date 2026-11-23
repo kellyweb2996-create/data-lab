@@ -5,7 +5,7 @@
 // =====================================================================
 import * as THREE from 'three';
 import { CONFIG } from './config.js';
-import { clamp, damp, loadFirstGLB, loadAllGLB, loadFirstTexture, loadTexture } from './utils.js';
+import { clamp, damp, loadFirstGLB, loadAllGLB, loadFirstTexture } from './utils.js';
 import { Ocean } from './Ocean.js';
 import { Terrain } from './Terrain.js';
 import { Submarine } from './Submarine.js';
@@ -15,6 +15,7 @@ import { Shark } from './Shark.js';
 import { Sonar } from './Sonar.js';
 import { HUD } from './HUD.js';
 import { AudioManager } from './AudioManager.js';
+import { PostFX } from './PostFX.js';
 
 const BEST_KEY = 'deepDive.best';
 const _v1 = new THREE.Vector3();
@@ -35,7 +36,6 @@ async function loadAssets(onProgress) {
     sandD: loadFirstTexture(A.sand.diffuse),
     sandN: loadFirstTexture(A.sand.normal),
     sandR: loadFirstTexture(A.sand.roughness),
-    caust0: loadTexture(A.causticsFrame(0)),
   };
   const keys = Object.keys(jobs);
   let done = 0;
@@ -45,22 +45,14 @@ async function loadAssets(onProgress) {
     onProgress(++done / keys.length);
   }));
 
-  // 첫 프레임이 있을 때만 나머지 31장을 불러옴
-  let caustics = null;
-  if (results.caust0) {
-    const rest = await Promise.all(Array.from({ length: A.causticsFrames - 1 }, (_, i) => loadTexture(A.causticsFrame(i + 1))));
-    caustics = [results.caust0, ...rest].filter(Boolean);
-    for (const t of caustics) { t.wrapS = t.wrapT = THREE.RepeatWrapping; }
-  }
   return {
     submarine: results.submarine, fish: results.fish, shark: results.shark,
     treasure: results.treasure, shipwreck: results.shipwreck,
     sand: { diffuse: results.sandD, normal: results.sandN, roughness: results.sandR },
-    caustics,
     report: {
       submarine: !!results.submarine, fish: results.fish.length, shark: !!results.shark,
       treasure: !!results.treasure, shipwreck: !!results.shipwreck,
-      sand: !!(results.sandD || results.sandN || results.sandR), caustics: caustics ? caustics.length : 0,
+      sandDiffuse: !!results.sandD, sandNormal: !!results.sandN, sandRoughness: !!results.sandR,
     },
   };
 }
@@ -72,8 +64,10 @@ export class Game {
     this.pixelRatio = Math.min(window.devicePixelRatio || 1, 1.75);
     this.renderer.setPixelRatio(this.pixelRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
+    // 톤매핑·출력 색공간 (후처리의 OutputPass가 이 설정을 읽어 마지막에 적용)
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.1;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
@@ -103,7 +97,7 @@ export class Game {
 
     this.ocean = new Ocean(this.scene, assets);
     this.ocean.setPixelRatio(this.pixelRatio);
-    this.terrain = new Terrain(this.scene, this.ocean, assets);
+    this.terrain = new Terrain(this.scene, this.ocean, assets, this.renderer);
     this.sub = new Submarine(this.scene, assets.submarine);
     this.treasures = new TreasureField(this.scene, assets.treasure, this.ocean, this.terrain);
     this.fish = new FishSchool(this.scene, assets.fish, this.terrain);
@@ -117,6 +111,7 @@ export class Game {
     this.state = 'menu';
     this.hud.setLoading('준비 완료', true);
     this.hud.showStart(this._loadBest());
+    this.postfx = new PostFX(this.renderer, this.scene, this.camera);
     this.renderer.setAnimationLoop(() => this._loop());
   }
 
@@ -179,6 +174,7 @@ export class Game {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+    if (this.postfx) this.postfx.setSize(w, h);
   }
 
   // ------------------------------------------------------------------
@@ -283,7 +279,7 @@ export class Game {
   // ------------------------------------------------------------------
   _loop() {
     const dt = Math.min(this.clock.getDelta(), 0.05); // 프레임 드랍 시 물리 폭주 방지
-    if (this.state === 'paused') { this.renderer.render(this.scene, this.camera); return; }
+    if (this.state === 'paused') { this.postfx.render(0); return; }
     this.time += dt;
 
     if (this.state === 'playing') {
@@ -300,7 +296,7 @@ export class Game {
     this.terrain.update(dt);
     this.treasures.update(dt, this.state === 'playing' ? this.sub.position : _v1.set(1e5, 0, 0), this.time);
     this.ocean.update(dt, this.camera, this.sub.lightOn);
-    this.renderer.render(this.scene, this.camera);
+    this.postfx.render(dt);
   }
 
   _updatePlaying(dt) {

@@ -72,12 +72,28 @@ npx serve .
 | `assets/models/shark.glb` (또는 `fish/shark.glb`) | 구·원뿔 조합 상어 (애니메이션 클립이 있으면 첫 번째 클립을 재생) |
 | `assets/models/treasure.glb` | 상자 + 반원통 뚜껑 보물 상자 |
 | `assets/models/shipwreck.glb` | 상자·원통 조합 난파선 |
-| `assets/textures/caustics/caust00.png` ~ `caust31.png` | 보로노이 패턴 캔버스 텍스처 (두 겹을 흘려 일렁이게) |
-| `assets/textures/sand/diffuse·normal·roughness` (`.jpg` 또는 `.png`) | 수심·경사에 따라 칠한 정점 색 |
+| `assets/textures/sand/sand_03_diff_2k.jpg` (색상)<br>`sand_03_nor_gl_2k.jpg` (노멀, OpenGL 방식)<br>`sand_03_rough_2k.jpg` (거칠기) | 셰이더로 만든 절차적 모래 무늬(모래알 + 물결 요철) |
 
 - 브라우저는 폴더 목록을 읽을 수 없어서 물고기 파일명은 `src/config.js`의 `assets.fish`에 나열해 두었습니다. 다른 이름을 쓰려면 여기에 추가하세요.
 - 모델은 크기가 자동으로 맞춰지지만, **+Z 방향이 앞쪽**이라고 가정합니다.
-- caustics 프레임은 초당 20장 속도로 순서대로 넘깁니다.
+- 물빛 일렁임(caustics)은 파일 없이 GLSL 셰이더(보로노이 노이즈 두 겹)로 실시간 생성합니다.
+
+### 모래 텍스처 조절 (`src/Terrain.js` 맨 위 상수)
+
+| 상수 | 기본값 | 의미 |
+|---|---|---|
+| `SAND_REPEAT` | 200 | 지형 한 변(640m)에 텍스처를 몇 번 반복할지. 200이면 한 장이 약 3.2m입니다. 모래알이 크게 보이면 값을 키우고, 너무 잘면 줄이세요. |
+| `SAND_NORMAL_SCALE` | 1.0 | 노멀맵 요철 강도 |
+| `SAND_MACRO_SCALE` | 0.27 | 타일링 깨기용 두 번째 샘플의 배율 (작을수록 큰 무늬) |
+| `SAND_MACRO_MIX` | 0.45 | 두 번째 샘플이 섞이는 평균 비율 |
+
+같은 텍스처를 원래 크기와 회전·확대한 크기로 두 번 샘플링하고, 위치마다 노이즈로 섞는 비율을 바꿔 반복 무늬가 티 나지 않게 했습니다.
+diffuse만 sRGB, 노멀·거칠기 맵은 선형으로 읽고, anisotropy는 GPU 최대값을 씁니다.
+
+### 후처리 조절 (`src/PostFX.js` 맨 위 상수)
+
+`BLOOM_STRENGTH`·`BLOOM_RADIUS`·`BLOOM_THRESHOLD`(블룸), `VIGNETTE`(가장자리 어둡기), `EDGE_DISTORT`(가장자리 물결 왜곡).
+렌더링 순서는 RenderPass → UnrealBloomPass → 수중 효과(왜곡·비네팅) → OutputPass(ACES 톤매핑, sRGB 출력)입니다.
 
 ---
 
@@ -91,8 +107,9 @@ deep-dive/
     ├── config.js       # 밸런스·물리·에셋 경로 설정 (수치 조정은 여기서)
     ├── utils.js        # 심플렉스 노이즈, 시드 난수, 에셋 로더, 절차적 텍스처
     ├── Submarine.js    # 잠수함 모델 + 관성/저항/밸러스트 물리, 기울기, 프로펠러, 탐조등
-    ├── Ocean.js        # 수심별 FogExp2·조명, 수면, god rays, caustics, 부유물·거품 파티클, 수면 기지
-    ├── Terrain.js      # 노이즈 해저 지형, 바위·산호·해초·난파선 배치, 충돌용 높이 조회
+    ├── Ocean.js        # 수심별 FogExp2·조명, 수면, 원뿔 god rays, 보로노이 caustics, 부유물·발광 플랑크톤·거품, 수면 기지
+    ├── PostFX.js       # 후처리: 블룸, 비네팅, 가장자리 물결 왜곡, 톤매핑 출력
+    ├── Terrain.js      # 노이즈 해저 지형, 모래 텍스처(타일링 깨기)·절차적 모래, 바위·산호·해초·난파선, 충돌용 높이
     ├── Treasures.js    # 보물 상자 배치·수집
     ├── FishSchool.js   # Boids 물고기 떼 (InstancedMesh, 180마리)
     ├── Shark.js        # 상어 순찰 → 추격 → 후퇴 상태 머신
@@ -108,7 +125,8 @@ deep-dive/
 |---|---|---|
 | 1. 최소 버전 | 잠수함 3D 자유 이동, 관성·저항, 기울기, 프로펠러, 추적 카메라(lerp), V 시점 전환 | `Submarine.js`, `Game._updateCamera` |
 | 2. 지형·안개 | 심플렉스 노이즈 지형(분지 + 해구 + 가장자리 절벽), 수심별 FogExp2, 바위·산호·해초·난파선, 충돌 반발·손상 | `Terrain.js`, `Ocean.update`, `Game._resolveCollisions` |
-| 3. 물빛·파티클 | caustics 셰이더 주입, god rays, 부유물(셰이더로 카메라 주변 무한 반복), 거품 풀, 탐조등 | `Ocean.applyCaustics`, `Ocean._build*` |
+| 3. 물빛·파티클 | caustics 셰이더 주입, god rays, 부유물(셰이더로 카메라 주변 무한 반복), 거품 풀, 탐조등 | `Ocean.injectCaustics`, `Ocean._build*` |
+| 9. 그래픽 강화 | 모래 텍스처(2K, 타일링 깨기), 보로노이 caustics, 원뿔 god rays, 블룸·비네팅·왜곡 후처리 | `Terrain.js`(injectSand), `Ocean.js`, `PostFX.js` |
 | 4. 보물·생존 | 보물 10개, 산소·배터리·내구도·수압, 기지 충전, 성공/실패·기록 | `Treasures.js`, `Game._updatePlaying`, `Game._endGame` |
 | 5. 물고기 떼 | Boids(분리·정렬·응집) + 잠수함 회피, InstancedMesh | `FishSchool.js` |
 | 6. 상어 | 순찰 경로 → 추격(예측 조준) → 공격 후 후퇴 | `Shark.js` |

@@ -66,12 +66,11 @@ export const CONFIG = {
     shark: ['assets/models/shark.glb', 'assets/models/fish/shark.glb'],
     treasure: ['assets/models/treasure.glb'],
     shipwreck: ['assets/models/shipwreck.glb'],
-    causticsFrames: 32,
-    causticsFrame: (i) => `assets/textures/caustics/caust${String(i).padStart(2, '0')}.png`,
+    // 해저 모래 텍스처 (2K). 앞쪽 파일이 없으면 다음 이름을 시도하고, 모두 없으면 셰이더 절차적 모래
     sand: {
-      diffuse: ['assets/textures/sand/diffuse.jpg', 'assets/textures/sand/diffuse.png'],
-      normal: ['assets/textures/sand/normal.jpg', 'assets/textures/sand/normal.png'],
-      roughness: ['assets/textures/sand/roughness.jpg', 'assets/textures/sand/roughness.png'],
+      diffuse: ['assets/textures/sand/sand_03_diff_2k.jpg', 'assets/textures/sand/diffuse.jpg', 'assets/textures/sand/diffuse.png'],
+      normal: ['assets/textures/sand/sand_03_nor_gl_2k.jpg', 'assets/textures/sand/normal.jpg', 'assets/textures/sand/normal.png'],
+      roughness: ['assets/textures/sand/sand_03_rough_2k.jpg', 'assets/textures/sand/roughness.jpg', 'assets/textures/sand/roughness.png'],
     },
   },
 };

@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deep Dive — 심해 보물 탐사</title>
+  <style>
+    :root {
+      --cyan: #5ff6ff; --gold: #ffd25a; --red: #ff5a6a;
+      --panel: rgba(3, 22, 34, 0.62); --line: rgba(95, 246, 255, 0.28);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #01060d; color: #dff8ff;
+      font-family: "Pretendard", "Noto Sans KR", "Apple SD Gothic Neo", system-ui, sans-serif; user-select: none; }
+    #app, #app canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+    .hidden { display: none !important; }
+
+    /* ---------- HUD ---------- */
+    #hud { position: fixed; inset: 0; pointer-events: none; }
+    .panel { position: absolute; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 12px 14px; backdrop-filter: blur(4px); }
+    .tl { top: 16px; left: 16px; width: 250px; }
+    .depth { font-size: 40px; font-weight: 800; letter-spacing: -1px; font-variant-numeric: tabular-nums; line-height: 1; }
+    .depth small { font-size: 16px; margin-left: 4px; opacity: .7; }
+    .depth.danger { color: var(--red); animation: blink .6s infinite alternate; }
+    .depth-sub { font-size: 11px; opacity: .65; margin: 4px 0 10px; }
+    .gauge { display: grid; grid-template-columns: 62px 1fr 40px; align-items: center; gap: 8px; margin-top: 7px; font-size: 12px; }
+    .gauge .bar { height: 9px; background: rgba(255,255,255,.1); border-radius: 5px; overflow: hidden; }
+    .gauge i { display: block; height: 100%; width: 100%; border-radius: 5px; transition: width .2s; }
+    #g-oxygen i { background: linear-gradient(90deg, #39c6ff, #8ff0ff); }
+    #g-battery i { background: linear-gradient(90deg, #6ee36e, #c8ff7a); }
+    #g-hull i { background: linear-gradient(90deg, #ffb347, #ffe07a); }
+    .gauge.low i { background: var(--red) !important; animation: blink .5s infinite alternate; }
+    .gauge span { text-align: right; font-variant-numeric: tabular-nums; }
+    .tc { top: 16px; left: 50%; transform: translateX(-50%); text-align: center; padding: 8px 22px; }
+    #treasureVal { font-size: 20px; font-weight: 700; color: var(--gold); }
+    #timeVal { font-size: 13px; opacity: .75; font-variant-numeric: tabular-nums; }
+    .tr { top: 16px; right: 16px; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; padding: 10px 12px; font-size: 12px; }
+    .chip { padding: 3px 9px; border-radius: 99px; border: 1px solid var(--line); opacity: .75; }
+    .chip.on { color: #241b00; background: var(--gold); border-color: var(--gold); opacity: 1; }
+    #st-dock { color: #002a2e; background: var(--cyan); opacity: 1; }
+    #warnings { position: absolute; top: 96px; left: 50%; transform: translateX(-50%); text-align: center;
+      color: var(--red); font-weight: 700; font-size: 16px; text-shadow: 0 0 8px rgba(0,0,0,.8); }
+    #warnings div { margin: 4px 0; animation: blink .7s infinite alternate; }
+    #toast { position: absolute; bottom: 120px; left: 50%; transform: translateX(-50%) translateY(10px); opacity: 0;
+      background: rgba(3, 22, 34, .8); border: 1px solid var(--line); padding: 10px 20px; border-radius: 99px;
+      font-size: 15px; transition: opacity .3s, transform .3s; white-space: nowrap; }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    .radar-wrap { position: absolute; right: 16px; bottom: 16px; text-align: center; }
+    #radar { width: 220px; height: 220px; display: block; filter: drop-shadow(0 0 10px rgba(95,246,255,.25)); }
+    #sonarCd { margin-top: 4px; font-size: 12px; opacity: .7; }
+    #sonarCd.ready { color: var(--cyan); opacity: 1; }
+    .keys { position: absolute; left: 16px; bottom: 16px; font-size: 11px; opacity: .55; line-height: 1.7; max-width: 420px; }
+    .keys b { display: inline-block; min-width: 18px; padding: 0 5px; border: 1px solid rgba(255,255,255,.35);
+      border-radius: 4px; text-align: center; font-weight: 600; margin-right: 2px; }
+    #damageFlash { position: absolute; inset: 0; box-shadow: inset 0 0 160px 40px rgba(255, 30, 40, 0.7); opacity: 0; }
+    #damageFlash.on { animation: flash .5s ease-out; }
+    /* 1인칭 조종석: 둥근 창틀 */
+    #porthole { position: absolute; inset: 0;
+      background: radial-gradient(ellipse 62% 70% at 50% 50%, transparent 82%, rgba(20, 30, 36, .9) 86%, #0c1418 100%); }
+    #porthole::after { content: ""; position: absolute; left: 50%; top: 50%; width: 24px; height: 24px; margin: -12px;
+      border: 1px solid rgba(95,246,255,.5); border-radius: 50%; }
+
+    /* ---------- 화면 (시작/결과/일시정지) ---------- */
+    .screen { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px;
+      background: radial-gradient(ellipse at 50% 30%, rgba(4,40,60,.35), rgba(1,6,13,.82)); }
+    .card { width: min(560px, 100%); max-height: 100%; overflow: auto; background: rgba(3, 22, 34, .82); border: 1px solid var(--line);
+      border-radius: 18px; padding: 28px; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+    h1 { margin: 0 0 4px; font-size: 40px; letter-spacing: 2px; color: var(--cyan); text-shadow: 0 0 24px rgba(95,246,255,.5); }
+    h2 { margin: 0 0 8px; font-size: 34px; }
+    h2.ok { color: var(--gold); } h2.fail { color: var(--red); }
+    .sub { opacity: .75; margin: 0 0 18px; line-height: 1.6; font-size: 14px; }
+    table.keys-t { margin: 0 auto 18px; border-collapse: collapse; font-size: 13px; text-align: left; }
+    table.keys-t td { padding: 3px 10px; }
+    table.keys-t td:first-child { color: var(--gold); text-align: right; font-weight: 700; white-space: nowrap; }
+    button { pointer-events: auto; cursor: pointer; font: inherit; font-size: 17px; font-weight: 700; padding: 12px 34px;
+      border-radius: 99px; border: none; background: linear-gradient(90deg, #2fd8ff, #5ff6c8); color: #022;
+      box-shadow: 0 0 24px rgba(95,246,255,.35); margin: 4px; }
+    button:disabled { opacity: .4; cursor: wait; }
+    button.ghost { background: transparent; color: var(--cyan); border: 1px solid var(--line); box-shadow: none; }
+    #loadingText { font-size: 12px; opacity: .6; margin-top: 10px; }
+    .best { margin-top: 16px; font-size: 13px; opacity: .8; line-height: 1.7; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 18px 0; }
+    .stats div { background: rgba(255,255,255,.05); border-radius: 12px; padding: 12px 6px; }
+    .stats small { display: block; opacity: .6; font-size: 12px; }
+    .stats b { font-size: 22px; }
+    #resNew { color: var(--gold); font-weight: 800; margin-bottom: 8px; }
+
+    @keyframes blink { from { opacity: 1; } to { opacity: .45; } }
+    @keyframes flash { from { opacity: 1; } to { opacity: 0; } }
+    @media (max-width: 720px) {
+      .tl { width: 190px; padding: 8px 10px; } .depth { font-size: 28px; }
+      #radar { width: 150px; height: 150px; } .keys { display: none; }
+      #toast { bottom: 200px; white-space: normal; text-align: center; width: max-content; max-width: calc(100% - 32px); }
+      .tc { top: auto; bottom: 16px; left: 16px; transform: none; }
+    }
+  </style>
+  <!-- Three.js (ES 모듈) — 빌드 도구 없이 importmap으로 불러옴 -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+
+  <!-- ===== HUD ===== -->
+  <div id="hud" class="hidden">
+    <div id="porthole" class="hidden"></div>
+    <div id="damageFlash"></div>
+    <div class="panel tl">
+      <div class="depth"><span id="depthVal">0.0</span><small>m</small></div>
+      <div class="depth-sub">최대 <span id="maxDepthVal">0</span>m · 안전 한계 100m</div>
+      <div class="gauge" id="g-oxygen"><label>산소</label><div class="bar"><i></i></div><span>100%</span></div>
+      <div class="gauge" id="g-battery"><label>배터리</label><div class="bar"><i></i></div><span>100%</span></div>
+      <div class="gauge" id="g-hull"><label>선체</label><div class="bar"><i></i></div><span>100%</span></div>
+    </div>
+    <div class="panel tc"><div id="treasureVal">보물 0 / 10</div><div id="timeVal">00:00</div></div>
+    <div class="panel tr">
+      <span class="chip" id="st-light">탐조등 OFF</span>
+      <span class="chip" id="st-view">3인칭</span>
+      <span class="chip hidden" id="st-dock">기지 도킹 중</span>
+    </div>
+    <div id="warnings"></div>
+    <div id="toast"></div>
+    <div class="keys">
+      <b>W</b><b>S</b> 전진·후진 &nbsp; <b>A</b><b>D</b> 회전 &nbsp; <b>Space</b> 상승 &nbsp; <b>Shift</b> 하강<br>
+      <b>Q</b> 소나 &nbsp; <b>L</b> 탐조등 &nbsp; <b>V</b> 시점 &nbsp; <b>M</b> 소리 &nbsp; <b>Esc</b> 일시정지 &nbsp; 드래그: 시점 · 휠: 거리
+    </div>
+    <div class="radar-wrap"><canvas id="radar" width="220" height="220"></canvas><div id="sonarCd">소나 준비 (Q)</div></div>
+  </div>
+
+  <!-- ===== 시작 화면 ===== -->
+  <div id="startScreen" class="screen">
+    <div class="card">
+      <h1>DEEP DIVE</h1>
+      <p class="sub">해저에 흩어진 <b style="color:var(--gold)">보물 상자 10개</b>를 찾아<br>산소가 떨어지기 전에 <b style="color:var(--cyan)">수면 기지</b>로 돌아오세요.</p>
+      <table class="keys-t">
+        <tr><td>W / S</td><td>전진 · 후진</td></tr>
+        <tr><td>A / D</td><td>좌우 회전</td></tr>
+        <tr><td>Space / Shift</td><td>상승 · 하강 (밸러스트 탱크)</td></tr>
+        <tr><td>마우스 드래그</td><td>시점 회전 (휠: 카메라 거리)</td></tr>
+        <tr><td>Q</td><td>소나 — 주변 보물을 레이더에 표시 (5초 쿨타임)</td></tr>
+        <tr><td>L</td><td>탐조등 켜기/끄기 — 깊은 곳은 필수</td></tr>
+        <tr><td>V</td><td>3인칭 / 조종석 1인칭</td></tr>
+      </table>
+      <p class="sub" style="font-size:12px">기지에서 산소·배터리가 충전됩니다 · 100m보다 깊으면 수압으로 선체가 손상됩니다 · 상어 조심!</p>
+      <button id="startBtn" disabled>잠수 시작</button>
+      <div id="loadingText">불러오는 중…</div>
+      <div class="best" id="bestStart"></div>
+    </div>
+  </div>
+
+  <!-- ===== 결과 화면 ===== -->
+  <div id="resultScreen" class="screen hidden">
+    <div class="card">
+      <h2 id="resultTitle">임무 성공!</h2>
+      <p class="sub" id="resultReason"></p>
+      <div id="resNew" class="hidden">★ 신기록! ★</div>
+      <div class="stats">
+        <div><small>수집한 보물</small><b id="resTreasure">0 / 10</b></div>
+        <div><small>걸린 시간</small><b id="resTime">00:00</b></div>
+        <div><small>최대 수심</small><b id="resDepth">0 m</b></div>
+      </div>
+      <button id="retryBtn">다시 잠수</button>
+      <button id="menuBtn" class="ghost">처음 화면</button>
+      <div class="best" id="bestResult"></div>
+    </div>
+  </div>
+
+  <!-- ===== 일시정지 ===== -->
+  <div id="pauseScreen" class="screen hidden">
+    <div class="card"><h2>일시정지</h2><p class="sub">Esc 또는 P로 계속</p><button id="resumeBtn">계속하기</button></div>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

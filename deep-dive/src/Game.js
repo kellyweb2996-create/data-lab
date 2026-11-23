@@ -111,7 +111,11 @@ export class Game {
     this.state = 'menu';
     this.hud.setLoading('준비 완료', true);
     this.hud.showStart(this._loadBest());
-    this.postfx = new PostFX(this.renderer, this.scene, this.camera);
+    // 주소 끝에 ?fx=0 을 붙이면 후처리(블룸 등)를 끄고 바로 그림 — 문제 확인·저사양용
+    const fxOff = new URLSearchParams(location.search).get('fx') === '0';
+    this.postfx = fxOff
+      ? { render: () => this.renderer.render(this.scene, this.camera), setSize: () => {} }
+      : new PostFX(this.renderer, this.scene, this.camera);
     this.renderer.setAnimationLoop(() => this._loop());
   }
 

@@ -18,6 +18,25 @@ export const BLOOM_THRESHOLD = 1.0;   // 이 밝기(선형 HDR)보다 밝은 곳
 export const VIGNETTE = 0.32;         // 가장자리 어둡기 (0~1)
 export const EDGE_DISTORT = 0.0035;   // 가장자리 물결 왜곡 크기 (화면 비율)
 
+/**
+ * 블룸 전에 비정상 픽셀(NaN·무한대)을 걸러낸다.
+ * 셰이더 하나가 픽셀 하나라도 NaN을 내면 블룸이 여러 단계로 번지며
+ * 화면에 큰 검은 사각형 덩어리가 생기므로, 0으로 바꾸고 너무 밝은 값은 잘라 둔다.
+ */
+const SanitizeShader = {
+  uniforms: { tDiffuse: { value: null } },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse; varying vec2 vUv;
+    void main() {
+      vec4 c = texture2D(tDiffuse, vUv);
+      if (any(isnan(c)) || any(isinf(c))) c = vec4(0.0, 0.0, 0.0, 1.0);
+      gl_FragColor = vec4(min(max(c.rgb, vec3(0.0)), vec3(64.0)), 1.0);
+    }`,
+};
+
 const UnderwaterShader = {
   uniforms: {
     tDiffuse: { value: null },
@@ -53,6 +72,7 @@ export class PostFX {
     const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: 4 });
     this.composer = new EffectComposer(renderer, rt);
     this.composer.addPass(new RenderPass(scene, camera));
+    this.composer.addPass(new ShaderPass(SanitizeShader)); // NaN 검은 덩어리 방지
     this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), BLOOM_STRENGTH, BLOOM_RADIUS, BLOOM_THRESHOLD);
     this.composer.addPass(this.bloom);
     this.underwater = new ShaderPass(UnderwaterShader);
